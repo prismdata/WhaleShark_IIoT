@@ -2,14 +2,10 @@ import logging
 import sys
 import math
 import json
-from datetime import timedelta
-import datetime
-import select
-import asyncio
 import time
-
+from datetime import datetime
 import pika
-
+import mongo_manager
 from net_socket.signal_killer import GracefulInterruptHandler
 
 logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', stream=sys.stdout, level=logging.DEBUG,
@@ -100,7 +96,7 @@ def config_fac_msg(equipment_id, fac_daq, modbus_udp, redis_fac_info):
     decimal_point = modbus_udp['meta']['decimal_point']
     pv = float(sensor_value)  # * math.pow(10, float(decimal_point))
     decimal_point = math.pow(10, float(decimal_point))
-    
+    fac_daq[equipment_id]['pub_time'] = modbus_udp['meta']['pub_time']
     fac_daq[equipment_id]['ms_time'] = modbus_udp['meta']['ms_time']
     fac_daq[equipment_id][sensor_desc] = pv / decimal_point
     fac_msg = json.dumps({equipment_id: fac_daq[equipment_id]})
@@ -109,20 +105,25 @@ def config_fac_msg(equipment_id, fac_daq, modbus_udp, redis_fac_info):
 
 class AsyncServer:
     
-    def convert(self, list):
-        return tuple(i for i in list)
+    def __init__(self, redis_manager):
+        self.mongo_mgr = mongo_manager.MongoMgr()
+        self.redis_mgr = redis_manager
+        
+    def convert(self, packet_list):
+        return tuple(i for i in packet_list)
     
     def publish_facility_msg(self, mqtt_con, exchange_name, routing_key, json_body):
         try:
             logging.debug('exchange name:' + exchange_name + ' routing key:' + routing_key)
             logging.debug('channel is open:' + str(mqtt_con.is_open))
-            if mqtt_con.is_open == False:
+            if mqtt_con.is_open is False:
                 credentials = pika.PlainCredentials('whaleshark', 'whaleshark')
                 param = pika.ConnectionParameters('localhost', 5672, '/', credentials)
                 connection = pika.BlockingConnection(param)
                 mqtt_con = connection.channel()
                 mqtt_con.queue_declare(queue='facility')
                 mqtt_con.exchange_declare(exchange=exchange_name, exchange_type='fanout')
+            
             mqtt_con.basic_publish(exchange=exchange_name, routing_key=routing_key, body=json_body)
             return mqtt_con, json.loads(json_body)
         
@@ -171,15 +172,22 @@ class AsyncServer:
                 decimal_point = int('0x{:02x}'.format(byte_tuple[17]), 16)
                 logging.debug('**8Byte pressure:' + str(sensor_code) + ':' + fv)
                 fv = int(fv, 16)
-                # str_hex_utc_time = ((datetime.datetime.utcnow()+ timedelta(hours=9)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-1])
+                
                 ms_time = time.time()
+                pub_time = datetime.fromtimestamp(time.time())
+                mongo_db_name = 'facility'
+                collection = group + group_code
+                doc_key = '%s-%s-%s' % (pub_time.year, pub_time.month, pub_time.day)
+                pub_time = str(pub_time).replace('.', 'ms')
+                self.mongo_mgr.document_upsert(mongo_db_name, collection, doc_key, pub_time)
                 modbus_dict = {'equipment_id': group + group_code, 'meta': {'ip': host,
                                                                             'port': port,
                                                                             'ms_time': ms_time,
                                                                             'sensor_cd': sensor_code,
                                                                             'fun_cd': fn,
                                                                             'sensor_value': fv,
-                                                                            'decimal_point': decimal_point
+                                                                            'decimal_point': decimal_point,
+                                                                            'pub_time': str(pub_time)
                                                                             }}
                 
                 status = 'OK'
@@ -190,7 +198,7 @@ class AsyncServer:
         logging.debug(status + str(packet_bytes) + str(modbus_dict))
         return status, str(packet_bytes), modbus_dict
     
-    async def get_client(self, event_manger, server_sock, msg_size, redis_con, rabbit_channel):
+    async def get_client(self, event_manger, server_sock, msg_size, rabbit_channel):
         """
         It create client socket with server sockt
         event_manger        It has asyncio event loop
@@ -198,7 +206,6 @@ class AsyncServer:
         msg_size            It means the packet size to be acquired at a time from the client socket.
         msg_queue           It means the queue containing the message transmitted from the gateway.
         """
-        self.redis_con = redis_con
         with GracefulInterruptHandler() as h:
             client = None
             while True:
@@ -218,8 +225,8 @@ class AsyncServer:
             msg_size            It means the packet size to be acquired at a time from the client socket.
             msg_queue           It means the queue containing the message transmitted from the gateway.
         """
-        
-        
+
+        fac_daq = get_fac_inf(self.redis_mgr)
         with GracefulInterruptHandler() as h:
             while True:
                 if not h.interrupted:
@@ -233,13 +240,12 @@ class AsyncServer:
                     if packet:
                         try:
                             logging.debug('try convert')
-                            fac_daq = get_fac_inf(self.redis_con)
                             host, port = client.getpeername()
                             status, packet, modbus_udp = self.convert_hex2decimal(packet, host, port)
                             if status == 'OK':
                                 equipment_id = modbus_udp['equipment_id']
-                                logging.debug('equipment_id:'+ equipment_id)
-                                redis_fac_info = json.loads(self.redis_con.get('facilities_info'))
+                                logging.debug('equipment_id:' + equipment_id)
+                                redis_fac_info = json.loads(self.redis_mgr.get('facilities_info'))
                                 if equipment_id in redis_fac_info.keys():
                                     logging.debug('config factory message')
                                     fac_msg = config_fac_msg(equipment_id, fac_daq, modbus_udp, redis_fac_info)
